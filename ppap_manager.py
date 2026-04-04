@@ -17,7 +17,9 @@ Full path structure:
 Run:
     streamlit run ppap_manager.py
 """
-
+cd Desktop
+cd PPAP
+echo %CD%
 import streamlit as st
 import pandas as pd
 import os
