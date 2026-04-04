@@ -1,12 +1,26 @@
 """
-PPAP Manager — with Debug Mode
-Run: streamlit run ppap_manager.py
+PPAP Manager
+============
+Folder naming rule:  <PI>-<PN>-<CUSTOMER>
+Example:  S383A014-06104173AA-1CYNAO
+            PI = S383A014       (Order number)
+            PN = 06104173AA     (Customer Part Number)
+            CUSTOMER = 1CYNAO   (Customer Code)
+
+Full path structure:
+  PPAP\
+    <Engineer>\          e.g. Alina
+      <Customer>\        e.g. 1CYNAO
+        <PI>-<PN>-<Customer>\
+          *.xlsx  *.docx  *.xdw  (any filename, no rule needed)
+
+Run:
+    streamlit run ppap_manager.py
 """
 
 import streamlit as st
 import pandas as pd
 import os
-import re
 import subprocess
 import platform
 from pathlib import Path
@@ -23,15 +37,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-SUPPORTED_EXT = {".xlsx", ".docx", ".xdw"}
-
-# Naming rule: [PI]_[PN]_[CUSTOMER].[ext]
-FILE_PATTERN = re.compile(
-    r"^(?P<PI>[^_]+)_(?P<PN>[^_]+)_(?P<CUSTOMER>[^_.]+)(?P<EXT>\.[a-zA-Z0-9]+)$",
-    re.IGNORECASE,
-)
-
 DEFAULT_FOLDER = r"C:\Users\S2234009\Desktop\PPAP"
+
+EXCEL_EXT = {".xlsx", ".xls", ".xlsm"}
+WORD_EXT  = {".docx", ".doc"}
+XDW_EXT   = {".xdw"}
+ALL_EXT   = EXCEL_EXT | WORD_EXT | XDW_EXT
 
 DOCUWORKS_PATHS = [
     r"C:\Program Files\Fuji Xerox\DocuWorks\deskew.exe",
@@ -41,71 +52,99 @@ DOCUWORKS_PATHS = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA PIPELINE
+# BLOCK 1 — DATA PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def scan_directory(folder: str):
+def parse_folder_name(name: str) -> dict:
     """
-    Scan folder recursively.
-    Returns (DataFrame of matched files, list of skipped filenames).
+    Parse folder name:  <PI>-<PN>-<CUSTOMER>
+    e.g. S383A014-06104173AA-1CYNAO
+    Returns dict with keys PI, PN, CUSTOMER.
+    Falls back gracefully if fewer than 3 parts.
     """
-    folder_path = Path(folder)
-    if not folder_path.exists():
-        return pd.DataFrame(), [], "Folder does not exist."
+    parts = name.split("-", 2)
+    return {
+        "PI":       parts[0].strip() if len(parts) > 0 else name,
+        "PN":       parts[1].strip() if len(parts) > 1 else "—",
+        "CUSTOMER": parts[2].strip() if len(parts) > 2 else "—",
+    }
 
-    all_files   = []
-    matched     = []
-    skipped     = []
 
-    for fp in folder_path.rglob("*"):
-        if not fp.is_file():
+def classify_files(folder_path: Path) -> dict:
+    """Classify files directly inside folder_path by extension."""
+    result = {"excel": [], "word": [], "xdw": [], "other": []}
+    for f in sorted(folder_path.iterdir()):
+        if not f.is_file():
             continue
-        if fp.suffix.lower() not in SUPPORTED_EXT:
+        ext = f.suffix.lower()
+        if ext in EXCEL_EXT:
+            result["excel"].append(f)
+        elif ext in WORD_EXT:
+            result["word"].append(f)
+        elif ext in XDW_EXT:
+            result["xdw"].append(f)
+        else:
+            result["other"].append(f)
+    return result
+
+
+def scan_ppap_root(root: str) -> list:
+    """
+    Walk root recursively.
+    A folder is a PPAP record when it contains at least one
+    supported file (.xlsx / .docx / .xdw) directly inside it.
+    """
+    root_path = Path(root)
+    if not root_path.exists():
+        return []
+
+    records = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dp = Path(dirpath)
+
+        # Only process folders that have at least one supported file directly inside
+        supported = [f for f in filenames if Path(f).suffix.lower() in ALL_EXT]
+        if not supported:
             continue
-        all_files.append(fp.name)
-        m = FILE_PATTERN.match(fp.name)
-        if not m:
-            skipped.append(fp.name)
-            continue
+
+        files  = classify_files(dp)
+        parsed = parse_folder_name(dp.name)
+
+        # Engineer = first sub-folder level below root
         try:
-            stat    = fp.stat()
-            created = datetime.fromtimestamp(stat.st_ctime).strftime("%Y-%m-%d")
-            size_kb = round(stat.st_size / 1024, 1)
-        except OSError:
-            created, size_kb = "—", 0
+            rel_parts = dp.relative_to(root_path).parts
+            engineer  = rel_parts[0] if len(rel_parts) >= 1 else "—"
+        except ValueError:
+            engineer = "—"
 
-        matched.append({
-            "PI":        m.group("PI"),
-            "PN":        m.group("PN"),
-            "CUSTOMER":  m.group("CUSTOMER"),
-            "EXT":       m.group("EXT").lower(),
-            "FILE_NAME": fp.name,
-            "FILE_PATH": str(fp),
-            "CREATED":   created,
-            "SIZE_KB":   size_kb,
+        records.append({
+            "FOLDER_NAME":  dp.name,
+            "PI":           parsed["PI"],
+            "PN":           parsed["PN"],
+            "CUSTOMER":     parsed["CUSTOMER"],
+            "ENGINEER":     engineer,
+            "FOLDER_PATH":  str(dp),
+            "EXCEL_COUNT":  len(files["excel"]),
+            "WORD_COUNT":   len(files["word"]),
+            "XDW_COUNT":    len(files["xdw"]),
+            "HAS_8D":       len(files["word"]) > 0,
+            "EXCEL_FILES":  files["excel"],
+            "WORD_FILES":   files["word"],
+            "XDW_FILES":    files["xdw"],
         })
 
-    if not matched:
-        df = pd.DataFrame(
-            columns=["PI","PN","CUSTOMER","EXT","FILE_NAME","FILE_PATH","CREATED","SIZE_KB"]
-        )
-    else:
-        df = pd.DataFrame(matched)
-        df.sort_values(["PN","PI"], ascending=[True,False], inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-    msg = f"Found {len(all_files)} supported file(s) total. " \
-          f"{len(matched)} matched naming rule. " \
-          f"{len(skipped)} skipped (wrong name format)."
-    return df, skipped, msg
+    # Sort by PI desc
+    records.sort(key=lambda r: r["PI"], reverse=True)
+    return records
 
 
-@st.cache_data(ttl=60, show_spinner="Scanning folder…")
-def get_index(folder: str):
-    return scan_directory(folder)
+@st.cache_data(ttl=60, show_spinner="Scanning PPAP folder…")
+def get_index(root: str) -> list:
+    return scan_ppap_root(root)
 
 
 def extract_xlsx_summary(file_path: str) -> dict:
+    """Extract up to 10 key-value rows from first sheet."""
     try:
         wb = load_workbook(file_path, read_only=True, data_only=True)
         ws = wb.active
@@ -114,7 +153,7 @@ def extract_xlsx_summary(file_path: str) -> dict:
             for i, cell in enumerate(row):
                 if isinstance(cell, str) and cell.strip() and i + 1 < len(row):
                     val = row[i + 1]
-                    if val is not None and len(result) < 8:
+                    if val is not None and len(result) < 10:
                         result[cell.strip()] = val
         wb.close()
         return result
@@ -126,24 +165,36 @@ def extract_xlsx_summary(file_path: str) -> dict:
 # FILE OPENERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def open_file_os(file_path: str):
+def open_file(path: str):
     try:
         if platform.system() == "Windows":
-            os.startfile(file_path)
+            os.startfile(path)
         elif platform.system() == "Darwin":
-            subprocess.run(["open", file_path], check=True)
+            subprocess.run(["open", path], check=True)
         else:
-            subprocess.run(["xdg-open", file_path], check=True)
+            subprocess.run(["xdg-open", path], check=True)
     except Exception as e:
         st.error(f"Cannot open file: {e}")
 
 
-def open_docuworks(file_path: str):
-    dw_exe = next((p for p in DOCUWORKS_PATHS if os.path.exists(p)), None)
-    if dw_exe:
-        subprocess.Popen([dw_exe, file_path])
+def open_folder(path: str):
+    try:
+        if platform.system() == "Windows":
+            subprocess.Popen(f'explorer "{path}"')
+        elif platform.system() == "Darwin":
+            subprocess.run(["open", path])
+        else:
+            subprocess.run(["xdg-open", path])
+    except Exception as e:
+        st.error(f"Cannot open folder: {e}")
+
+
+def open_docuworks(path: str):
+    dw = next((p for p in DOCUWORKS_PATHS if os.path.exists(p)), None)
+    if dw:
+        subprocess.Popen([dw, path])
     else:
-        open_file_os(file_path)
+        open_file(path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,32 +206,36 @@ with st.sidebar:
     st.divider()
 
     folder = st.text_input(
-        "PPAP folder path",
+        "PPAP root folder",
         value=st.session_state.get("folder", DEFAULT_FOLDER),
         key="folder",
+        help="Top-level PPAP folder, e.g. C:\\Users\\...\\Desktop\\PPAP",
     )
 
     debug_mode = st.toggle("🔍 Debug mode", value=False,
-                           help="Show all files found in folder and naming issues")
+                           help="Show all folders & files the app can see")
 
     if st.button("🔄  Re-scan folder", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-    df_index, skipped_files, scan_msg = get_index(folder)
+    records = get_index(folder)
+    df      = pd.DataFrame([
+        {"PI": r["PI"], "PN": r["PN"], "CUSTOMER": r["CUSTOMER"],
+         "HAS_8D": r["HAS_8D"]}
+        for r in records
+    ]) if records else pd.DataFrame()
 
     st.divider()
-    col1, col2 = st.columns(2)
-    col1.metric("Total files", len(df_index))
-    col2.metric("PN codes",    df_index["PN"].nunique() if not df_index.empty else 0)
-
-    if not df_index.empty:
-        n_8d = df_index[df_index["EXT"] == ".docx"]["PN"].nunique()
-        st.metric("PN codes with 8D alerts", n_8d)
+    c1, c2 = st.columns(2)
+    c1.metric("PPAP records", len(records))
+    c2.metric("Customers",    df["CUSTOMER"].nunique() if not df.empty else 0)
+    st.metric("Records with 8D docs ⚠",
+              int(df["HAS_8D"].sum()) if not df.empty else 0)
 
     st.divider()
     st.caption(f"Refreshed: {datetime.now().strftime('%d/%m/%Y  %H:%M')}")
-    st.caption(f"Folder: `{folder}`")
+    st.caption(f"Root: `{folder}`")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,226 +244,220 @@ with st.sidebar:
 
 st.title("🔍  Search PPAP")
 
-# ── DEBUG MODE ────────────────────────────────────────────────────────────────
-if debug_mode:
-    st.subheader("🔍 Debug — Folder scan report")
+running_local = platform.system() == "Windows"
 
-    folder_path = Path(folder)
-
-    # 1. Does folder exist?
-    if not folder_path.exists():
-        st.error(f"❌ Folder does not exist: `{folder}`")
-    else:
-        st.success(f"✅ Folder exists: `{folder}`")
-
-        # 2. List ALL files in folder (any extension)
-        all_items = list(folder_path.rglob("*"))
-        all_actual_files = [f for f in all_items if f.is_file()]
-
-        st.info(f"Total files found (all types): **{len(all_actual_files)}**")
-
-        if all_actual_files:
-            file_data = []
-            for f in all_actual_files:
-                m = FILE_PATTERN.match(f.name)
-                parsed_ok = m is not None and f.suffix.lower() in SUPPORTED_EXT
-                file_data.append({
-                    "File name":    f.name,
-                    "Extension":    f.suffix.lower(),
-                    "Supported":    "✅" if f.suffix.lower() in SUPPORTED_EXT else "❌",
-                    "Name matches rule": "✅" if parsed_ok else "❌",
-                    "PI":       m.group("PI")       if parsed_ok else "—",
-                    "PN":       m.group("PN")       if parsed_ok else "—",
-                    "CUSTOMER": m.group("CUSTOMER") if parsed_ok else "—",
-                })
-            st.dataframe(pd.DataFrame(file_data), use_container_width=True, hide_index=True)
-        else:
-            st.warning("No files found inside this folder at all.")
-
-        # 3. Naming rule reminder
-        st.markdown("""
-**Naming rule required:**
-```
-[PI]_[PN]_[CUSTOMER].[ext]
-```
-Example: `PI-2024-091_PN-4471_CUST01.xlsx`
-
-- Exactly **2 underscores `_`** separating 3 parts
-- Extension must be `.xlsx`, `.docx`, or `.xdw`
-- Spaces in filename are **not allowed**
-        """)
-
-        # 4. Skipped files detail
-        if skipped_files:
-            st.warning(f"⚠️ {len(skipped_files)} file(s) skipped due to naming mismatch:")
-            for f in skipped_files:
-                st.code(f)
-        else:
-            if all_actual_files:
-                st.success("✅ All supported files passed the naming check.")
-
-    st.divider()
-
-# ── FOLDER / INDEX GUARDS ─────────────────────────────────────────────────────
+# ── Folder guard ──────────────────────────────────────────────────────────────
 if not Path(folder).exists():
     st.error(
         f"**Folder not found:** `{folder}`\n\n"
-        "Make sure the folder exists on your computer, then click **Re-scan folder**.\n\n"
-        "💡 Tip: turn on **Debug mode** in the sidebar to see exactly what the app can find."
+        "Update the path in the sidebar to your actual PPAP root folder, "
+        "then click **Re-scan folder**."
     )
     st.stop()
 
-if df_index.empty:
+# ── Debug panel ───────────────────────────────────────────────────────────────
+if debug_mode:
+    st.subheader("🔍 Debug — Folder scan report")
+    root_path = Path(folder)
+    all_dirs  = [d for d in root_path.rglob("*") if d.is_dir()]
+
+    st.success(f"✅ Folder exists: `{folder}`")
+    st.info(
+        f"Sub-folders found: **{len(all_dirs)}** &nbsp;|&nbsp; "
+        f"PPAP records indexed: **{len(records)}**"
+    )
+
+    if records:
+        preview = pd.DataFrame([{
+            "Folder name": r["FOLDER_NAME"],
+            "PI":          r["PI"],
+            "PN":          r["PN"],
+            "Customer":    r["CUSTOMER"],
+            "Engineer":    r["ENGINEER"],
+            "Excel":       r["EXCEL_COUNT"],
+            "Word":        r["WORD_COUNT"],
+            "XDW":         r["XDW_COUNT"],
+            "8D?":         "⚠️" if r["HAS_8D"] else "✅",
+        } for r in records])
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+    else:
+        st.warning(
+            "No PPAP records found. The app looks for sub-folders "
+            "that contain at least one .xlsx, .docx, or .xdw file."
+        )
+        st.markdown("**First 30 sub-folders found:**")
+        for d in sorted(all_dirs)[:30]:
+            st.code(str(d.relative_to(root_path)))
+
+    st.divider()
+
+# ── Empty guard ───────────────────────────────────────────────────────────────
+if not records:
     st.warning(
-        f"No matching files found in `{folder}`.\n\n"
-        "Files must follow this naming rule:\n"
-        "```\n[PI]_[PN]_[CUSTOMER].xlsx\n"
-        "[PI]_[PN]_[CUSTOMER].docx\n"
-        "[PI]_[PN]_[CUSTOMER].xdw\n```\n"
-        "Example: `PI-2024-091_PN-4471_CUST01.xlsx`\n\n"
-        "💡 Turn on **Debug mode** in the sidebar to see the full list of files and what's wrong."
+        f"No PPAP records found in `{folder}`.\n\n"
+        "The app scans sub-folders that contain `.xlsx`, `.docx`, or `.xdw` files.\n\n"
+        "💡 Turn on **Debug mode** in the sidebar to diagnose."
     )
     st.stop()
 
-# ── SEARCH BAR ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH BAR
+# ─────────────────────────────────────────────────────────────────────────────
+
 keyword = st.text_input(
     "Search",
-    placeholder="Enter PI number, PN code, or Customer Code…",
+    placeholder="Enter PI (order number), PN (part number), or Customer code…",
     label_visibility="collapsed",
 )
 
+# ── No keyword → browse all ───────────────────────────────────────────────────
 if not keyword:
-    st.info("Enter a PI number, PN code, or Customer Code above to search.")
-    with st.expander("📋  Browse all indexed files"):
-        st.dataframe(
-            df_index[["PI","PN","CUSTOMER","EXT","CREATED","SIZE_KB"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+    st.info("Enter a search term above, or browse all records below.")
+
+    customers = ["All"] + sorted(set(r["CUSTOMER"] for r in records))
+    sel_cust  = st.selectbox("Filter by customer", customers)
+    filtered  = records if sel_cust == "All" else \
+                [r for r in records if r["CUSTOMER"] == sel_cust]
+
+    tbl = pd.DataFrame([{
+        "PI":            r["PI"],
+        "Part Number":   r["PN"],
+        "Customer":      r["CUSTOMER"],
+        "Engineer":      r["ENGINEER"],
+        "Excel files":   r["EXCEL_COUNT"],
+        "Word docs":     r["WORD_COUNT"],
+        "DocuWorks":     r["XDW_COUNT"],
+        "8D alert":      "⚠️ Yes" if r["HAS_8D"] else "✅ No",
+    } for r in filtered])
+
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# QUERY & ANALYZE
+# QUERY & FILTER
 # ─────────────────────────────────────────────────────────────────────────────
 
 kw = keyword.strip().upper()
-mask = (
-    df_index["PI"].str.upper().str.contains(kw, na=False)
-    | df_index["PN"].str.upper().str.contains(kw, na=False)
-    | df_index["CUSTOMER"].str.upper().str.contains(kw, na=False)
-)
-results = df_index[mask].copy()
+matched = [
+    r for r in records
+    if kw in r["PI"].upper()
+    or kw in r["PN"].upper()
+    or kw in r["CUSTOMER"].upper()
+    or kw in r["ENGINEER"].upper()
+    or kw in r["FOLDER_NAME"].upper()
+]
 
-if results.empty:
+if not matched:
     st.warning(f"No results found for **{keyword}**.")
     st.stop()
 
-st.caption(f"Found **{len(results)}** file(s) matching **{keyword}**")
+st.caption(f"Found **{len(matched)}** record(s) matching **{keyword}**")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESULTS — ONE SECTION PER PN
+# RESULTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-running_local = platform.system() == "Windows"
+for rec in matched:
 
-for pn in results["PN"].unique():
-    pn_df    = results[results["PN"] == pn]
-    customer = pn_df["CUSTOMER"].iloc[0]
-
-    xlsx_count   = int((pn_df["EXT"] == ".xlsx").sum())
-    xdw_count    = int((pn_df["EXT"] == ".xdw").sum())
-    docx_count   = int((pn_df["EXT"] == ".docx").sum())
-    update_count = xlsx_count + xdw_count
-
-    # 8D alert
-    if docx_count > 0:
+    # ── 8D Alert banner ───────────────────────────────────────────────────────
+    if rec["HAS_8D"]:
         st.error(
-            f"⚠️ **8D Alert** — {docx_count} defect report(s) (.docx) linked to "
-            f"**{pn}**. Review root causes and corrective actions."
+            f"⚠️ **8D Alert** — {rec['WORD_COUNT']} Word document(s) found for "
+            f"PI **{rec['PI']}**. Review root causes and corrective actions."
         )
     else:
-        st.success(f"✅ **{pn}** — No 8D reports on record.")
+        st.success(f"✅ PI **{rec['PI']}** — No 8D / Word reports found.")
 
-    st.subheader(f"📦  {pn}  —  Customer: {customer}")
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.subheader(f"📦  PI: {rec['PI']}  |  PN: {rec['PN']}  |  Customer: {rec['CUSTOMER']}")
+    st.caption(f"Engineer: {rec['ENGINEER']}  ·  Folder: `{rec['FOLDER_PATH']}`")
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("PPAP update count",  update_count)
-    c2.metric("DocuWorks drawings", xdw_count)
-    c3.metric("8D reports (.docx)", docx_count)
+    c1.metric("Excel / Data files",    rec["EXCEL_COUNT"])
+    c2.metric("Word / 8D reports",     rec["WORD_COUNT"])
+    c3.metric("DocuWorks drawings",    rec["XDW_COUNT"])
+
+    # Open folder button
+    if running_local:
+        if st.button("📁  Open folder in Explorer",
+                     key=f"folder_{rec['FOLDER_NAME']}"):
+            open_folder(rec["FOLDER_PATH"])
 
     st.divider()
-    st.markdown("#### PPAP history")
 
-    for _, row in pn_df.sort_values("PI", ascending=False).iterrows():
-        with st.expander(
-            f"**{row['PI']}** &nbsp;|&nbsp; `{row['EXT']}` &nbsp;|&nbsp; {row['CREATED']}",
-            expanded=False,
-        ):
-            st.code(row["FILE_PATH"], language=None)
-
-            # ── .xlsx ─────────────────────────────────────────────────────────
-            if row["EXT"] == ".xlsx":
+    # ── Excel files ───────────────────────────────────────────────────────────
+    if rec["EXCEL_FILES"]:
+        st.markdown("**📊 Excel / Measurement files**")
+        for fp in rec["EXCEL_FILES"]:
+            with st.expander(f"`{fp.name}`", expanded=False):
                 col_a, col_b = st.columns(2)
-                if col_a.button("📊  View measurement data",
-                                key=f"view_{row['FILE_NAME']}"):
+                if col_a.button("📊  View data",
+                                key=f"view_{rec['FOLDER_NAME']}_{fp.name}"):
                     with st.spinner("Reading Excel…"):
-                        summary = extract_xlsx_summary(row["FILE_PATH"])
+                        summary = extract_xlsx_summary(str(fp))
                     if summary:
-                        st.table(pd.DataFrame(summary.items(),
-                                              columns=["Parameter","Value"]))
+                        st.table(pd.DataFrame(
+                            summary.items(), columns=["Parameter", "Value"]
+                        ))
                     else:
-                        st.info("No structured data found in this file.")
+                        st.info("No structured data found. Open the file directly.")
 
                 if running_local:
                     if col_b.button("📂  Open file",
-                                    key=f"open_{row['FILE_NAME']}"):
-                        open_file_os(row["FILE_PATH"])
-                        st.toast("Opening Excel file…")
+                                    key=f"open_{rec['FOLDER_NAME']}_{fp.name}"):
+                        open_file(str(fp))
+                        st.toast(f"Opening {fp.name}…")
                 else:
                     try:
-                        with open(row["FILE_PATH"], "rb") as f:
+                        with open(str(fp), "rb") as f:
                             col_b.download_button(
-                                "⤓  Download",
-                                data=f,
-                                file_name=row["FILE_NAME"],
+                                "⤓  Download", data=f,
+                                file_name=fp.name,
                                 mime="application/vnd.openxmlformats-officedocument"
                                      ".spreadsheetml.sheet",
-                                key=f"dl_{row['FILE_NAME']}",
+                                key=f"dl_{rec['FOLDER_NAME']}_{fp.name}",
                             )
                     except OSError:
                         col_b.warning("File not accessible.")
 
-            # ── .docx ─────────────────────────────────────────────────────────
-            elif row["EXT"] == ".docx":
-                st.warning("📄  8D report — review root cause and corrective action.")
+    # ── Word / 8D files ───────────────────────────────────────────────────────
+    if rec["WORD_FILES"]:
+        st.markdown("**📄 Word / 8D report files**")
+        for fp in rec["WORD_FILES"]:
+            with st.expander(f"`{fp.name}`  ⚠️", expanded=False):
+                st.warning("8D / Word document — review root cause and corrective action.")
                 if running_local:
-                    if st.button("📖  Open 8D report",
-                                 key=f"8d_{row['FILE_NAME']}"):
-                        open_file_os(row["FILE_PATH"])
-                        st.toast("Opening 8D report…")
+                    if st.button("📖  Open document",
+                                 key=f"word_{rec['FOLDER_NAME']}_{fp.name}"):
+                        open_file(str(fp))
+                        st.toast(f"Opening {fp.name}…")
                 else:
                     try:
-                        with open(row["FILE_PATH"], "rb") as f:
+                        with open(str(fp), "rb") as f:
                             st.download_button(
-                                "⤓  Download 8D report",
-                                data=f,
-                                file_name=row["FILE_NAME"],
+                                "⤓  Download", data=f,
+                                file_name=fp.name,
                                 mime="application/vnd.openxmlformats-officedocument"
                                      ".wordprocessingml.document",
-                                key=f"dl8d_{row['FILE_NAME']}",
+                                key=f"dldoc_{rec['FOLDER_NAME']}_{fp.name}",
                             )
                     except OSError:
                         st.warning("File not accessible.")
 
-            # ── .xdw ─────────────────────────────────────────────────────────
-            elif row["EXT"] == ".xdw":
-                st.info("🖼  Drawing / document (DocuWorks format)")
+    # ── DocuWorks files ───────────────────────────────────────────────────────
+    if rec["XDW_FILES"]:
+        st.markdown("**🖼 DocuWorks files**")
+        for fp in rec["XDW_FILES"]:
+            with st.expander(f"`{fp.name}`", expanded=False):
+                st.info("DocuWorks drawing / document")
                 if running_local:
                     if st.button("🖥  Open in DocuWorks Viewer",
-                                 key=f"dw_{row['FILE_NAME']}"):
-                        open_docuworks(row["FILE_PATH"])
-                        st.toast("Launching DocuWorks Viewer…")
+                                 key=f"dw_{rec['FOLDER_NAME']}_{fp.name}"):
+                        open_docuworks(str(fp))
+                        st.toast(f"Launching DocuWorks for {fp.name}…")
                 else:
-                    st.info("DocuWorks files can only be opened on a local Windows machine.")
+                    st.info(
+                        "DocuWorks files can only be opened on a local Windows machine."
+                    )
 
     st.divider()
